@@ -44,6 +44,9 @@ using QuantumOpticsBase: QuantumOpticsBase, dm
         state_marker = :diamond,
         state_markercolor = :black,
         state_linecolor = :gray90,
+        channel_state_markersize = 0.4,
+        channel_state_marker = :rtriangle,
+        channel_state_markercolor = :black,
         lock_marker = '⚿',
         registercoords = nothing,
         observables = nothing,
@@ -56,9 +59,12 @@ function Makie.plot!(rn::RegisterNetPlot{<:Tuple{RegisterNet}})
 
     register_rectangles = Observable(Rect2f[])     # Makie rectangles that will be plotted for each register
     register_slots_coords = Observable(Point2f[])  # Makie marker locations that will be plotted for each register slot
-    state_coords = Observable(fill(Point2f(NaN, NaN), sum(nsubsystems.(registers))))  # NaN-padded fixed size
-    lock_coords = Observable(fill(Point2f(NaN, NaN), sum(nsubsystems.(registers))))  # NaN-padded fixed size
-    state_links = Observable(fill(Point2f(NaN, NaN), 2 * sum(nsubsystems.(registers))))  # NaN-padded fixed size; GLMakie GPU buffers cannot resize after plot creation
+    network_capacity = sum(nsubsystems.(registers))
+    state_coords = Observable(fill(Point2f(NaN, NaN), network_capacity))  # NaN-padded fixed size
+    channel_state_coords = Observable(fill(Point2f(NaN, NaN), network_capacity)) # one in-flight state per network slot; NaN-padded fixed size
+    channel_state_rotations = Observable(fill(0.0f0, network_capacity))
+    lock_coords = Observable(fill(Point2f(NaN, NaN), network_capacity))  # NaN-padded fixed size
+    state_links = Observable(fill(Point2f(NaN, NaN), 4 * network_capacity))  # NaN-padded fixed size; GLMakie GPU buffers cannot resize after plot creation
     observables_coords = Observable(Point2f[])     # Makie marker locations that will be plotted for each subsystem on which an observable is evaluated
     observables_links = Observable(Point2f[])      # The links between observed subsystems
     observables_vals = Observable(Float64[])       # Values of the observables (stored per marker)
@@ -66,12 +72,17 @@ function Makie.plot!(rn::RegisterNetPlot{<:Tuple{RegisterNet}})
     register_backref = Observable(Any[])           # A backreference to the register object for register square
     register_slots_coords_backref = Observable(Tuple{Any,Int,Int}[]) # A backreference to the register object and reference indices for each register slot marker
     state_coords_backref = Observable(Tuple{Any,Any,Int,Int,Int}[])  # A backreference to the state object and register object and reference indices for each state marker
+    channel_state_coords_backref = Observable(Tuple{Any,Int,Int,Float64,Int}[]) # State, source, destination, progress, and subsystem for each in-flight marker
     observables_backref = Observable(Tuple{Any,Float64}[])           # A backreference to the observable (and its value) for each colored dot visualizing an observable
     observables_links_backref = Observable(Tuple{Any,Float64}[])     # same as above but for the links
     _extras = Dict{Symbol, Any}(
         :register_backref => register_backref,
         :register_slots_coords_backref => register_slots_coords_backref,
         :state_coords_backref => state_coords_backref,
+        :channel_state_coords_backref => channel_state_coords_backref,
+        :channel_state_coords => channel_state_coords,
+        :channel_state_rotations => channel_state_rotations,
+        :state_links => state_links,
         :observables_backref => observables_backref,
         :observables_links_backref => observables_links_backref,
     )
@@ -121,13 +132,14 @@ function Makie.plot!(rn::RegisterNetPlot{<:Tuple{RegisterNet}})
         registercoords = rn[:registercoords][]
         all_nodes = [ # TODO it is rather wasteful to replot everything... do it smarter
             register_rectangles, register_slots_coords,
-            register_slots_coords_backref, state_coords_backref,
+            register_slots_coords_backref, state_coords_backref, channel_state_coords_backref,
             observables_coords, observables_links, observables_vals, observables_linkvals
         ]
         for a in all_nodes # using a naive `lift` would allocate, so instead we just empty each array and refill it; can still be done more elegantly with lift and preallocation
             empty!(a[])
         end
         state_coord_idx = 0
+        channel_state_coord_idx = 0
         lock_coord_idx = 0
         state_link_idx = 0
 
@@ -150,19 +162,53 @@ function Makie.plot!(rn::RegisterNetPlot{<:Tuple{RegisterNet}})
             end
         end
 
-        # the locations of the state subsystem markers and the lines connecting them (denoting belonging to the same system)
-        states = unique(Iterators.flatten(((s for s in r.staterefs if !isnothing(s)) for r in registers)))
+        # Locate temporary registers currently traveling through a quantum channel.
+        # DelayQueue does not expose values until their delay expires, so QuantumChannel
+        # retains these references explicitly until the corresponding take! completes.
+        inflight_registers = IdDict{Register,Any}()
+        for (route, qc) in network.qchannels
+            src, dst = route.first, route.second
+            src_coord, dst_coord = registercoords[src], registercoords[dst]
+            direction = dst_coord - src_coord
+            rotation = Float32(atan(direction[2], direction[1]))
+            time = ConcurrentSim.now(qc.queue.store.env)
+            for entry in QuantumSavory._inflight(qc)
+                progress = iszero(qc.queue.delay) ? 1.0 : clamp((time - entry.sent_at) / qc.queue.delay, 0.0, 1.0)
+                point = Point2f((1 - progress) * src_coord + progress * dst_coord)
+                inflight_registers[entry.register] = (; src, dst, progress, point, rotation)
+            end
+        end
+
+        # The locations of the state subsystem markers and the lines connecting them
+        # (denoting belonging to the same system), including channel-resident subsystems.
+        states = Any[s for r in registers for s in r.staterefs if !isnothing(s)]
+        for reg in keys(inflight_registers)
+            append!(states, (s for s in reg.staterefs if !isnothing(s)))
+        end
+        unique!(states)
         for s in states
             for (iˢ,(reg,iˢˡᵒᵗ)) in enumerate(zip(s.registers,s.registerindices))
                 isnothing(reg) && continue # TODO -- the state does not belong to a register... this should be a warning
                 whichreg = findfirst(o->===(reg,o),registers) # TODO -- some form of caching or a backref would be valuable to significantly optimize this (skip the need for a O(n) search)
-                isnothing(whichreg) && continue # TODO -- the state does not belong to a register in the network... maybe it is in a temporary message buffer register?
-                xˢ = registercoords[whichreg][1]
-                yˢ = registercoords[whichreg][2]+(iˢˡᵒᵗ-1)*rn[:scale][]
-                pˢ = Point2f(xˢ, yˢ)
-                state_coord_idx += 1
-                state_coords[][state_coord_idx] = pˢ
-                push!(state_coords_backref[], (s, network[whichreg], whichreg, iˢˡᵒᵗ, iˢ))
+                pˢ = if !isnothing(whichreg)
+                    xˢ = registercoords[whichreg][1]
+                    yˢ = registercoords[whichreg][2]+(iˢˡᵒᵗ-1)*rn[:scale][]
+                    point = Point2f(xˢ, yˢ)
+                    state_coord_idx += 1
+                    state_coords[][state_coord_idx] = point
+                    push!(state_coords_backref[], (s, network[whichreg], whichreg, iˢˡᵒᵗ, iˢ))
+                    point
+                elseif haskey(inflight_registers, reg)
+                    channel_state_coord_idx == length(channel_state_coords[]) && continue
+                    channel_data = inflight_registers[reg]
+                    channel_state_coord_idx += 1
+                    channel_state_coords[][channel_state_coord_idx] = channel_data.point
+                    channel_state_rotations[][channel_state_coord_idx] = channel_data.rotation
+                    push!(channel_state_coords_backref[], (s, channel_data.src, channel_data.dst, channel_data.progress, iˢ))
+                    channel_data.point
+                else
+                    continue
+                end
                 if nsubsystems(s) != 1
                     state_link_idx += 1
                     state_links[][state_link_idx] = pˢ
@@ -202,6 +248,13 @@ function Makie.plot!(rn::RegisterNetPlot{<:Tuple{RegisterNet}})
             state_coords[][i] = Point2f(NaN, NaN)
         end
         notify(state_coords)
+
+        for i in (channel_state_coord_idx + 1):length(channel_state_coords[])
+            channel_state_coords[][i] = Point2f(NaN, NaN)
+            channel_state_rotations[][i] = 0.0f0
+        end
+        notify(channel_state_coords)
+        notify(channel_state_rotations)
 
         for i in (lock_coord_idx + 1):length(lock_coords[])
             lock_coords[][i] = Point2f(NaN, NaN)
@@ -251,6 +304,11 @@ function Makie.plot!(rn::RegisterNetPlot{<:Tuple{RegisterNet}})
         marker=rn[:state_marker], markersize=rn[:state_markersize][]*rn[:scale][], color=rn[:state_markercolor],
         markerspace=:data,
         inspector_label = (self, i, p) -> get_state_vis_string(state_coords_backref[],i))
+    channel_state_scatterplot = scatter!(
+        rn, channel_state_coords,
+        marker=rn[:channel_state_marker], markersize=rn[:channel_state_markersize][]*rn[:scale][], color=rn[:channel_state_markercolor],
+        rotation=channel_state_rotations, markerspace=:data,
+        inspector_label = (self, i, p) -> get_channel_state_vis_string(channel_state_coords_backref[],i))
     state_linesegmentsplot = linesegments!(rn, state_links, color=rn[:state_linecolor])
     state_linesegmentsplot.inspectable[] = false
     lock_scatterplot = scatter!(
@@ -265,6 +323,7 @@ function Makie.plot!(rn::RegisterNetPlot{<:Tuple{RegisterNet}})
     _extras[:observables_scatterplot] = observables_scatterplot
     _extras[:observables_linesegmentsplot] = observables_linesegments
     _extras[:state_scatterplot] = state_scatterplot
+    _extras[:channel_state_scatterplot] = channel_state_scatterplot
     _extras[:state_linesegmentsplot] = state_linesegmentsplot
     _extras[:lock_scatterplot] = lock_scatterplot
     rn[:_extras] = _extras
@@ -298,6 +357,12 @@ function get_state_vis_string(backrefs, i)
     return "Subsystem $(subsystem) of a state of $(nsubsystems(state)) subsystems, stored in\nRegister $(registeridx) | Slot $(slot)\n $(tags_str)"
 end
 
+function get_channel_state_vis_string(backrefs, i)
+    state, src, dst, progress, subsystem = backrefs[i]
+    percentage = round(Int, 100 * progress)
+    return "Subsystem $(subsystem) of a state of $(nsubsystems(state)) subsystems, traveling through\nQuantum channel $(src) → $(dst) | $(percentage)% complete"
+end
+
 abstract type RegisterNetGraphHandler end
 struct RNHandler <: RegisterNetGraphHandler
     rn
@@ -320,6 +385,10 @@ function Makie.process_interaction(handler::RNHandler, event::Makie.MouseEvent, 
         state, reg, registeridx, slot, subsystem = extras[:state_coords_backref][][index]
         try run(`clear`) catch end
         println("Subsystem stored in Register $(registeridx) | Slot $(slot)\n Subsystem $(subsystem) of $(state)")
+    elseif plot===extras[:channel_state_scatterplot]
+        state, src, dst, progress, subsystem = extras[:channel_state_coords_backref][][index]
+        try run(`clear`) catch end
+        println("Subsystem traveling through Quantum channel $(src) → $(dst) ($(round(Int, 100 * progress))% complete)\n Subsystem $(subsystem) of $(state)")
     elseif plot===extras[:observables_scatterplot]
         o, val = extras[:observables_backref][][index]
         try run(`clear`) catch end

@@ -42,6 +42,32 @@ fig
 
 The tall rectangles are registers, the gray squares are the slots of these registers, and the (connected) black diamonds denote when a slot is occupied by some subsystem (of a potentially larger) quantum state.
 
+States currently passing through a quantum channel are drawn as arrows between
+the source and destination registers. Their position is interpolated from the
+channel's send time and delay. If an in-flight subsystem is entangled with a
+subsystem in a register, the line connecting the two remains visible.
+
+```@example vis
+using ConcurrentSim
+
+travelnet = RegisterNet([Register(1), Register(1), Register(1)]; quantum_delay=10.0)
+initialize!((travelnet[1,1], travelnet[3,1]), (Z₁⊗Z₁ + Z₂⊗Z₂) / sqrt(2.0))
+put!(qchannel(travelnet, 1=>2), travelnet[1,1])
+ConcurrentSim.run(get_time_tracker(travelnet), 5.0)
+
+travelfig = Figure(size=(700,300))
+_, _, travelplot, travelobs = registernetplot_axis(
+    travelfig[1,1], travelnet;
+    registercoords=[Point2f(0,0), Point2f(5,0), Point2f(10,0)],
+)
+travelfig
+```
+
+After advancing the simulation, call `notify(travelobs)` to move or remove the
+in-flight arrows without rebuilding the plot. Their appearance can be themed
+with `channel_state_marker`, `channel_state_markersize`, and
+`channel_state_markercolor`.
+
 The visualization is capable of showing tooltips when hovering over different components of the plot, particularly valuable for debugging. Quantum observables can be directly calculated and plotted as well (through the `observables` keyword).
 
 Other configuration options are available as well (the ones ending on `plot` let you access the subplot objects used to create the visualization and the ones ending on `backref` provide convenient inverse mapping from graphical elements to the registers or states being visualized):

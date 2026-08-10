@@ -61,6 +61,31 @@ sref = regB.staterefs[1]
 
 end
 
+@testset "Quantum Channel tracks states in flight" begin
+
+sim = Simulation()
+regA = Register(1)
+regB = Register(1)
+initialize!(regA[1], Z1)
+qc = QuantumChannel(sim, 10.0)
+
+put!(qc, regA[1])
+@test length(QuantumSavory._inflight(qc)) == 1
+entry = only(QuantumSavory._inflight(qc))
+@test entry.sent_at == 0.0
+@test isassigned(entry.register[1])
+
+take!(qc, regB[1])
+run(sim, 5.0)
+@test length(QuantumSavory._inflight(qc)) == 1
+@test !isassigned(regB[1])
+
+run(sim)
+@test isempty(QuantumSavory._inflight(qc))
+@test isassigned(regB[1])
+
+end
+
 @testset "Quantum Channel with T1 decay" begin
 
 ## Test with T1Decay
